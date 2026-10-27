@@ -84,16 +84,19 @@ def init_db(conn: sqlite3.Connection) -> None:
             first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(seen_jobs)")}
+    if "url" not in cols:
+        conn.execute("ALTER TABLE seen_jobs ADD COLUMN url TEXT")
     conn.commit()
 
 
-def mark_seen(conn, job_id, title, company, outcome, ev=None) -> None:
+def mark_seen(conn, job_id, title, company, outcome, url,  ev=None) -> None:
     conn.execute(
         """INSERT OR IGNORE INTO seen_jobs
-           (job_id, title, company, outcome, is_match, fit_score, reasoning)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+   (job_id, title, company, outcome, url, is_match, fit_score, reasoning)
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            job_id, title, company, outcome,
+            job_id, title, company, outcome, url,
             int(ev.is_match) if ev else None,
             ev.fit_score if ev else None,
             ev.reasoning if ev else None,
@@ -140,10 +143,16 @@ def fetch_all(plan: dict) -> list[dict]:
     for page in range(1, MAX_PAGES + 1):
         try:
             results = fetch_adzuna_page(plan, page)
-        except requests.RequestException as e:
-            print(f"❌ Adzuna request failed ({plan['label']}, page {page}): {e}")
+        except requests.HTTPError as e:
+            # Don't print the URL: it contains the API key.
+            code = e.response.status_code if e.response is not None else "?"
+            hint = " (check ADZUNA_APP_ID / ADZUNA_APP_KEY in .env)" if code in (401, 403) else ""
+            print(f" Adzuna returned HTTP {code} ({plan['label']}, page {page}){hint}")
             break
-        print(f"📡 Adzuna | {plan['label']} | page {page} | {len(results)} jobs")
+        except requests.RequestException as e:
+            print(f" Adzuna request failed ({plan['label']}, page {page}): {type(e).__name__}")
+            break
+        print(f"From Adzuna | {plan['label']} | page {page} | {len(results)} jobs")
         jobs.extend(results)
         if len(results) < RESULTS_PER_PAGE:
             break
@@ -311,7 +320,7 @@ def evaluate_with_retry(*args, attempts: int = 4) -> JobEvaluation:
                     raise QuotaExhausted(str(e)) from e
                 raise
             wait = 10 * 2 ** attempt
-            print(f"   ⏳ Gemini returned {code}; retrying in {wait}s...")
+            print(f"   Time Gemini returned {code}; retrying in {wait}s...")
             time.sleep(wait)
 
 
@@ -328,7 +337,7 @@ def run() -> None:
         ["fetched", "duplicates", "already_seen", "prefiltered_out",
          "evaluated", "matches", "errors", "deferred"], 0)
 
-    print("🚀 Starting ingestion...")
+    print(" Starting ingestion...")
 
     # 1. Fetch every search and dedupe (remote jobs often appear in state searches too)
     jobs: dict[str, dict] = {}
@@ -359,7 +368,7 @@ def run() -> None:
 
             # 2. Free local filter
             if not prefilter_job(title, description):
-                mark_seen(conn, job_id, title, company, "prefiltered_out")
+                mark_seen(conn, job_id, title, company, "prefiltered_out", url = url)
                 stats["prefiltered_out"] += 1
                 continue
 
@@ -377,27 +386,27 @@ def run() -> None:
             try:
                 ev = evaluate_with_retry(title, company, location_name, description)
             except QuotaExhausted:
-                print("🛑 Gemini daily quota exhausted; remaining jobs will be evaluated next run.")
+                print("Stop Gemini daily quota exhausted; remaining jobs will be evaluated next run.")
                 quota_hit = True
                 stats["deferred"] += 1
                 continue
             except Exception as e:
-                print(f"   ⚠️ Evaluation error on {job_id} ({title}): {e}")
+                print(f"   Warning Evaluation error on {job_id} ({title}): {e}")
                 stats["errors"] += 1  # not marked seen, so it's retried next run
                 continue
 
             stats["evaluated"] += 1
-            mark_seen(conn, job_id, title, company, "evaluated", ev)
+            mark_seen(conn, job_id, title, company, "evaluated", ev = ev, url = url)
             if ev.is_match and ev.fit_score >= MIN_FIT_SCORE:
                 save_match(conn, job_id, title, company, location_name, url, ev)
                 stats["matches"] += 1
-                print(f"  ⭐ MATCH ({ev.fit_score}/100): {title} @ {company} [{location_name}]")
+                print(f"   MATCH ({ev.fit_score}/100): {title} @ {company} [{location_name}]")
             conn.commit()
     finally:
         conn.commit()
         conn.close()
 
-    print("\n🏁 Run finished")
+    print("\n Run finished")
     for key, value in stats.items():
         print(f"   {key.replace('_', ' '):<16} {value}")
 
