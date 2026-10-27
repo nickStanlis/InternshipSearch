@@ -31,6 +31,7 @@ STATUSES = {
     "offer": "Offer",
     "skip": "Not Interested",
     "reset": "Unreviewed",
+
 }
 CLOSED = ("Rejected", "Not Interested")
 STATUS_ORDER = ["Offer", "Interviewing", "Applied", "Unreviewed", "Rejected", "Not Interested"]
@@ -139,7 +140,7 @@ def cmd_review(conn, args):
            WHERE p.status = 'Unreviewed'
            ORDER BY p.fit_score DESC, p.date_logged DESC""").fetchall()
     if not rows:
-        print("Nothing left to review. 🎉")
+        print("Nothing left to review. ")
         return
 
     print(f"{len(rows)} postings to review.  "
@@ -172,7 +173,7 @@ def cmd_review(conn, args):
                 note = input("  Note: ").strip()
                 if note:
                     add_note(conn, rid, note)
-                    print("  ✓ Note added")
+                    print("   Note added")
             elif choice == "":
                 break               # leave as Unreviewed, come back later
             elif choice == "q":
