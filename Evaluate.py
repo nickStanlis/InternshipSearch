@@ -5,9 +5,8 @@ import textwrap
 import webbrowser
 from datetime import date
 
-from Tracker import STATUSES, cmd_set_status, add_note, connect, cut, cmd_list, cmd_show, cmd_note, cmd_summary
-from Tracker import CLOSED
-from Tracker import STATUS_ORDER
+from Tracker import STATUSES, cmd_set_status, add_note, connect
+
 
 
 def set_unevaluated(conn, args) -> None :
