@@ -81,24 +81,29 @@ def init_db(conn: sqlite3.Connection) -> None:
             is_match INTEGER,
             fit_score INTEGER,
             reasoning TEXT,
+            description TEXT,
             first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     cols = {row[1] for row in conn.execute("PRAGMA table_info(seen_jobs)")}
     if "url" not in cols:
-        conn.execute("ALTER TABLE seen_jobs ADD COLUMN url TEXT UNIQUE")
+        conn.execute("ALTER TABLE seen_jobs ADD COLUMN url TEXT")
     if "description" not in cols:
         conn.execute("ALTER TABLE seen_jobs ADD COLUMN description TEXT")
+    if "location" not in cols:
+        conn.execute("ALTER TABLE seen_jobs ADD COLUMN location TEXT" )
+    if "model" not in cols:
+        conn.execute("ALTER TABLE seen_jobs ADD COLUMN model TEXT") 
     conn.commit()
 
 
-def mark_seen(conn, job_id, title, company, outcome, url, description,  ev=None) -> None:
+def mark_seen(conn, job_id, title, company, location, outcome, url, description, model, ev=None) -> None:
     conn.execute(
         """INSERT OR IGNORE INTO seen_jobs
-   (job_id, title, company, outcome, url, is_match, description, fit_score, reasoning)
-   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+   (job_id, title, company, location, outcome, url, description, model, is_match, fit_score, reasoning)
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            job_id, title, company, outcome, url, description,
+            job_id, title, company, location, outcome, url, description, model,
             int(ev.is_match) if ev else None,
             ev.fit_score if ev else None,
             ev.reasoning if ev else None,
@@ -370,7 +375,7 @@ def run() -> None:
 
             # 2. Free local filter
             if not prefilter_job(title, description):
-                mark_seen(conn, job_id, title, company, "prefiltered_out", url = url, description = description)
+                mark_seen(conn, job_id, title, company, location_name,  "prefiltered_out",  url, description, None)
                 stats["prefiltered_out"] += 1
                 continue
 
@@ -398,7 +403,7 @@ def run() -> None:
                 continue
 
             stats["evaluated"] += 1
-            mark_seen(conn, job_id, title, company, "evaluated", ev = ev, url = url, description = description)
+            mark_seen(conn, job_id, title, company, location_name,"evaluated",   url,description, MODEL_NAME, ev)
             if ev.is_match and ev.fit_score >= MIN_FIT_SCORE:
                 save_match(conn, job_id, title, company, location_name, url, ev)
                 stats["matches"] += 1

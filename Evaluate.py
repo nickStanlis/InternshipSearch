@@ -5,20 +5,19 @@ import textwrap
 import webbrowser
 from datetime import date
 
-from Tracker import STATUSES, cmd_set_status, add_note, connect
+from Tracker import connect
 
 
 
 def set_unevaluated(conn, args) -> None :
     cols = {row[1] for row in conn.execute("PRAGMA table_info(seen_jobs)")}
     if "training_status" not in cols:
-        conn.execute("ALTER TABLE seen_jobs ADD COLUMN training_status TEXT DEFAULT 'Unevaluated'")
+        conn.execute("ALTER TABLE seen_jobs ADD COLUMN training_status TEXT DEFAULT 'Unlabeled'")
     conn.commit()
 
 
 
 def cmd_set_training_status(conn, refs, training_status):
-    today = date.today().isoformat()
     for ref in refs:
         rid = resolve_training(conn, ref)
         if rid is None:
@@ -35,7 +34,7 @@ def cmd_set_training_status(conn, refs, training_status):
     conn.commit()
 
 def resolve_training(conn, ref: str):
-    """Accept either the short # shown by `list` or the full Adzuna job_id."""
+
     row = None
     if ref.isdigit():
         row = conn.execute("SELECT rowid FROM seen_jobs WHERE rowid = ?", (int(ref),)).fetchone()
@@ -45,18 +44,19 @@ def resolve_training(conn, ref: str):
 
 
 
-def cmd_evaluate(conn, args):
+def cmd_evaluate(conn):
     """Walk through unevaluated postings one at a time, to cross validate ."""
     rows = conn.execute(
         """SELECT s.rowid, s.title, s.company,  s.url
            FROM seen_jobs s
-           WHERE s.training_status = 'Unevaluated'
+           WHERE s.training_status = 'Unlabeled' AND s.outcome = 'evaluated'
+           ORDER BY s.rowid DESC
            """).fetchall()
     if not rows:
         print("Nothing left to evaluate. ")
         return
 
-    print(f"{len(rows)} postings to evaluate.  "
+    print(f"{len(rows)} postings to label.  "
           "[o]pen  [y]es  [n]o  [Enter] next  [q]uit\n")
     for i, (rid, title, company,  url) in enumerate(rows, 1):
         print("=" * 90)
@@ -88,7 +88,7 @@ def main():
     parser = argparse.ArgumentParser(description="Track internship applications.")
     sub = parser.add_subparsers(dest="cmd")
 
-    sub.add_parser("evaluate", help="Go through unevaluated postings one by one")
+    sub.add_parser("evaluate", help="Go through unelabeled postings one by one")
 
     # No command (e.g. launched with an IDE's Run button) -> show the open list.
     args = parser.parse_args(sys.argv[1:] or ["evaluate"])
