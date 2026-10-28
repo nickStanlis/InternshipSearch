@@ -5,20 +5,9 @@ import textwrap
 import webbrowser
 from datetime import date
 
-from Tracker import STATUSES, cmd_set_status, add_note, connect, resolve, cut, cmd_list, cmd_show, cmd_note, cmd_summary
+from Tracker import STATUSES, cmd_set_status, add_note, connect, cut, cmd_list, cmd_show, cmd_note, cmd_summary
 from Tracker import CLOSED
 from Tracker import STATUS_ORDER
-DB_PATH = "matches.db"
-training_status = {
-    "unevaluated" : "Unevaluated",
-    "valid" : "Valid",
-    "invalid" : "Invalid",
-}
-training_status_ORDER = [
-    "valid",
-    "invalid",
-    "unevaluated",
-]
 
 
 def set_unevaluated(conn, args) -> None :
@@ -28,42 +17,51 @@ def set_unevaluated(conn, args) -> None :
     conn.commit()
 
 
+
 def cmd_set_training_status(conn, refs, training_status):
     today = date.today().isoformat()
     for ref in refs:
-        rid = resolve(conn, ref)
+        rid = resolve_training(conn, ref)
         if rid is None:
             print(f"  ? No posting #{ref}")
             continue
-        if training_status == "Unevaluated":
-            conn.execute(
-                "UPDATE seen_jobs SET training_status = ?,  WHERE rowid = ?",
-                (training_status, rid))
-        else:
-            conn.execute("UPDATE seen_jobs SET training_status = ?, WHERE rowid = ?",
-                         (training_status,  rid))
+
+        conn.execute(
+            "UPDATE seen_jobs SET training_status = ?  WHERE rowid = ?",
+            (training_status, rid))
+
         title, company = conn.execute(
             "SELECT title, company FROM seen_jobs WHERE rowid = ?", (rid,)).fetchone()
         print(f"   #{rid} {title} @ {company} new {training_status}")
     conn.commit()
 
+def resolve_training(conn, ref: str):
+    """Accept either the short # shown by `list` or the full Adzuna job_id."""
+    row = None
+    if ref.isdigit():
+        row = conn.execute("SELECT rowid FROM seen_jobs WHERE rowid = ?", (int(ref),)).fetchone()
+    if row is None:
+        row = conn.execute("SELECT rowid FROM seen_jobs WHERE job_id = ?", (ref,)).fetchone()
+    return row[0] if row else None
+
+
+
 def cmd_evaluate(conn, args):
     """Walk through unevaluated postings one at a time, to cross validate ."""
     rows = conn.execute(
-        """SELECT p.rowid, p.title, p.company, p.location, p.term, p.url
-           FROM job_postings p LEFT JOIN seen_jobs s ON s.job_id = p.job_id
-           WHERE p.training_status = 'Unevaluated'
-           ORDER BY p.date_logged DESC""").fetchall()
+        """SELECT s.rowid, s.title, s.company,  s.url
+           FROM seen_jobs s
+           WHERE s.training_status = 'Unevaluated'
+           """).fetchall()
     if not rows:
         print("Nothing left to evaluate. ")
         return
 
     print(f"{len(rows)} postings to evaluate.  "
           "[o]pen  [y]es  [n]o  [Enter] next  [q]uit\n")
-    for i, (rid, title, company, loc, term, url) in enumerate(rows, 1):
+    for i, (rid, title, company,  url) in enumerate(rows, 1):
         print("=" * 90)
         print(f"({i}/{len(rows)})  #{rid}  {title} @ {company}")
-        print(f"  {loc}  |  {term}")
         print(f"  {url or '(no URL)'}")
 
         while True:
@@ -75,9 +73,6 @@ def cmd_evaluate(conn, args):
                     print("  No URL for this posting.")
             elif choice == "y":
                 cmd_set_training_status(conn, [str(rid)], "Valid")
-                note = input("  Note (Enter to skip): ").strip()
-                if note:
-                    add_note(conn, rid, note)
                 break
             elif choice == "n":
                 cmd_set_training_status(conn, [str(rid)], "Invalid")
