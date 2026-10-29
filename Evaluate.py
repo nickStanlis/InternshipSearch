@@ -1,23 +1,23 @@
 import sys
-import sqlite3
 import argparse
 import textwrap
 import webbrowser
-from datetime import date
 
 from Tracker import connect
 
-
+LABELS = {"y": "Valid", "n": "Invalid"}
 
 def set_unevaluated(conn, args) -> None :
     cols = {row[1] for row in conn.execute("PRAGMA table_info(seen_jobs)")}
-    if "training_status" not in cols:
-        conn.execute("ALTER TABLE seen_jobs ADD COLUMN training_status TEXT DEFAULT 'Unlabeled'")
+    if "training_status_description" not in cols:
+        conn.execute("ALTER TABLE seen_jobs ADD COLUMN training_status_description TEXT DEFAULT 'Unlabeled'")
+    if "training_status_url" not in cols:
+        conn.execute("ALTER TABLE seen_jobs ADD COLUMN training_status_url TEXT DEFAULT 'Unlabeled'")
     conn.commit()
 
 
 
-def cmd_set_training_status(conn, refs, training_status):
+def cmd_set_training_status_description(conn, refs, training_status_description):
     for ref in refs:
         rid = resolve_training(conn, ref)
         if rid is None:
@@ -25,13 +25,31 @@ def cmd_set_training_status(conn, refs, training_status):
             continue
 
         conn.execute(
-            "UPDATE seen_jobs SET training_status = ?  WHERE rowid = ?",
-            (training_status, rid))
+            "UPDATE seen_jobs SET training_status_description = ?  WHERE rowid = ?",
+            (training_status_description, rid))
 
         title, company = conn.execute(
             "SELECT title, company FROM seen_jobs WHERE rowid = ?", (rid,)).fetchone()
-        print(f"   #{rid} {title} @ {company} new {training_status}")
+        print(f"   #{rid} {title} @ {company} new {training_status_description}")
     conn.commit()
+
+
+def cmd_set_training_status_url(conn, refs, training_status_url):
+    for ref in refs:
+        rid = resolve_training(conn, ref)
+        if rid is None:
+            print(f"  ? No posting #{ref}")
+            continue
+
+        conn.execute(
+            "UPDATE seen_jobs SET training_status_url = ?  WHERE rowid = ?",
+            (training_status_url, rid))
+
+        title, company = conn.execute(
+            "SELECT title, company FROM seen_jobs WHERE rowid = ?", (rid,)).fetchone()
+        print(f"   #{rid} {title} @ {company} new {training_status_url}")
+    conn.commit()
+
 
 def resolve_training(conn, ref: str):
 
@@ -43,46 +61,75 @@ def resolve_training(conn, ref: str):
     return row[0] if row else None
 
 
+def ask_label(prompt, url=None, allow_open=False):
+    """Ask for one label. Returns 'y', 'n', 'skip' or 'quit'.
+
+    'o' only works when allow_open is True, so the snippet step can't
+    peek at the full posting.
+    """
+    options = "[y]es  [n]o  [Enter] skip  [q]uit"
+    if allow_open:
+        options = "[o]pen  " + options
+    print(f"  {prompt}   {options}")
+
+    while True:
+        choice = input("> ").strip().lower()
+        if choice in LABELS:
+            return choice
+        if choice == "":
+            return "skip"
+        if choice == "q":
+            return "quit"
+        if choice == "o" and allow_open:
+            if url:
+                webbrowser.open(url)
+            else:
+                print("  No URL for this posting.")
+            continue  # stay on this question after opening
+        print(f"  Choose one of: {options}")
+
 
 def cmd_evaluate(conn):
-    """Walk through unevaluated postings one at a time, to cross validate ."""
+    """Label each evaluated job twice: from the snippet alone, then from the full posting."""
     rows = conn.execute(
-        """SELECT s.rowid, s.title, s.company,  s.url
-           FROM seen_jobs s
-           WHERE s.training_status = 'Unlabeled' AND s.outcome = 'evaluated'
-           ORDER BY s.rowid DESC
-           """).fetchall()
+        """SELECT rowid, title, company, url, description,
+                  training_status_description, training_status_url
+           FROM seen_jobs
+           WHERE outcome = 'evaluated'
+             AND (training_status_description = 'Unlabeled'
+                  OR training_status_url = 'Unlabeled')
+           ORDER BY rowid DESC""").fetchall()
     if not rows:
-        print("Nothing left to evaluate. ")
+        print("Nothing left to label.")
         return
 
     print(f"{len(rows)} postings to label.  "
-          "[o]pen  [y]es  [n]o  [Enter] next  [q]uit\n")
-    for i, (rid, title, company,  url) in enumerate(rows, 1):
+          "Step 1: snippet only.  Step 2: full posting.\n")
+
+    for i, (rid, title, company, url, description, snippet_label, full_label) in enumerate(rows, 1):
         print("=" * 90)
         print(f"({i}/{len(rows)})  #{rid}  {title} @ {company}")
-        print(f"  {url or '(no URL)'}")
+        print(textwrap.fill(description or "(no snippet stored)", width=88,
+                            initial_indent="  ", subsequent_indent="  "))
 
-        while True:
-            choice = input("> ").strip().lower()
-            if choice == "o":
-                if url:
-                    webbrowser.open(url)
-                else:
-                    print("  No URL for this posting.")
-            elif choice == "y":
-                cmd_set_training_status(conn, [str(rid)], "Valid")
-                break
-            elif choice == "n":
-                cmd_set_training_status(conn, [str(rid)], "Invalid")
-                break
-            elif choice == "":
-                break               # leave as Unevaluated, come back later
-            elif choice == "q":
+        # Step 1: snippet only (no URL shown, no [o]pen)
+        if snippet_label == "Unlabeled":
+            answer = ask_label("SNIPPET ONLY - is this a match?")
+            if answer == "quit":
                 return
-            else:
-                print("  o / y / n / Enter / q")
+            if answer == "skip":
+                continue  # skip the whole job; full label must come after the snippet label
+            cmd_set_training_status_description(conn, [str(rid)], LABELS[answer])
 
+        # Step 2: full posting (runs for both yes and no snippet labels)
+        if full_label == "Unlabeled":
+            print(f"\n  Now check the full posting: {url or '(no URL)'}")
+            answer = ask_label("FULL POSTING - is this a match?", url=url, allow_open=True)
+            if answer == "quit":
+                return
+            if answer == "skip":
+                continue  # snippet label is kept; this job comes back next session
+            cmd_set_training_status_url(conn, [str(rid)], LABELS[answer])
 
 def main():
     parser = argparse.ArgumentParser(description="Track internship applications.")
@@ -97,7 +144,7 @@ def main():
     try:
         set_unevaluated(conn, args)
         if args.cmd == "evaluate":
-            cmd_evaluate(conn, args)
+            cmd_evaluate(conn)
     finally:
         conn.close()
 

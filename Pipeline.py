@@ -93,7 +93,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     if "location" not in cols:
         conn.execute("ALTER TABLE seen_jobs ADD COLUMN location TEXT" )
     if "model" not in cols:
-        conn.execute("ALTER TABLE seen_jobs ADD COLUMN model TEXT") 
+        conn.execute("ALTER TABLE seen_jobs ADD COLUMN model TEXT")
     conn.commit()
 
 
