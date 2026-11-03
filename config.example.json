@@ -1,0 +1,84 @@
+{
+  "candidate_profile": {
+    "name": "Your Name",
+    "email": "you@example.edu",
+    "phone": "(555) 555-5555",
+    "links": {
+      "linkedin": "https://linkedin.com/in/your-profile",
+      "github": "https://github.com/your-username"
+    },
+    "work_authorization": {
+      "us_citizen_or_permanent_resident": true,
+      "requires_sponsorship": false,
+      "security_clearance_eligible": false
+    },
+    "education": {
+      "institution": "Your University",
+      "degree_type": "Bachelor of Science (B.S.)",
+      "program": "Your Program (e.g. Honors Program)",
+      "majors": ["Computer Science", "Data Science"],
+      "gpa": 3.5,
+      "expected_graduation": "Your Graduation Date"
+    },
+    "skills": {
+      "programming_languages": ["Python", "Java", "SQL"],
+      "frameworks_and_libraries": ["NumPy", "pandas", "scikit-learn"],
+      "domains": ["Data Analysis", "Machine Learning", "Data Visualization"],
+      "tools": ["Git", "GitHub", "Microsoft Excel"]
+    }
+  },
+  "search_and_matching_criteria": {
+    "target_roles": [
+      "Data Science Intern",
+      "Software Engineering Intern",
+      "Data Analyst Intern"
+    ],
+    "target_terms": {
+      "primary": ["Summer 2027"],
+      "secondary_acceptable": [
+        "Fall 2027 (Part-Time / Co-op)",
+        "Year-Round / Off-Cycle Intern"
+      ]
+    },
+    "location_constraints": {
+      "allowed_states": ["Your State"],
+      "metro_restrictions": "None (Any city/region within the allowed states)",
+      "allow_remote": true,
+      "strict_geographic_enforcement": true,
+      "require_housing_stipend": false
+    },
+    "eligibility_rules": {
+      "degree_level": ["Undergraduate", "Bachelors", "Four-Year Degree"],
+      "require_major_match": true,
+      "major_match_mode": "ANY_OF",
+      "acceptable_majors": [
+        "Computer Science",
+        "Data Science",
+        "Mathematics",
+        "Statistics"
+      ],
+      "graduation_window": {
+        "candidate_grad_date": "Your Graduation Date",
+        "reject_if_requires_earlier_grad": true
+      },
+      "sponsorship_filter": {
+        "allow_citizenship_required_roles": true,
+        "allow_clearance_required_roles": false
+      }
+    },
+    "scoring_weights": {
+      "location_and_term_match": 0.25,
+      "major_and_degree_match": 0.25,
+      "technical_skills_overlap": 0.30,
+      "domain_experience_fit": 0.20
+    },
+    "minimum_fit_score_to_save": 75
+  },
+  "pipeline_settings": {
+    "gemini_model": "gemini-3.5-flash-lite",
+    "max_pages_per_search": 2,
+    "max_days_old": 14,
+    "seconds_between_gemini_calls": 4.5,
+    "max_evaluations_per_run": 150
+  }
+}
