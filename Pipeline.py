@@ -36,18 +36,17 @@ SECONDS_BETWEEN_CALLS = SETTINGS.get("seconds_between_gemini_calls", 4.5)
 # Caps Gemini usage per run so one run can't burn the whole daily quota.
 MAX_EVALS_PER_RUN = SETTINGS.get("max_evaluations_per_run", 150)
 
+
 DB_PATH = "matches.db"
 RESULTS_PER_PAGE = 50
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # Adzuna: `what` words are ANDed, `what_or` words are ORed.
-KEYWORDS_OR = "software data analytics analyst python developer statistics quantitative"
-SEARCH_PLANS = [
-    {"label": "Michigan", "what": "intern", "where": "Michigan"},
-    {"label": "Colorado", "what": "intern", "where": "Colorado"},
-    {"label": "Remote", "what": "intern remote", "where": None},
-]
+KEYWORDS_OR = SETTINGS.get("search_keywords_or", "software data analytics analyst python developer statistics quantitative")
+SEARCH_PLANS = SETTINGS.get("search_plans", [])
+if not SEARCH_PLANS:
+    raise SystemExit("No search_plans found under pipeline_settings in config.json")
 
 
 # ---------------------------------------------------------------------------

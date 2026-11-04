@@ -132,7 +132,7 @@ def cmd_evaluate(conn):
             cmd_set_training_status_url(conn, [str(rid)], LABELS[answer])
 
 def main():
-    parser = argparse.ArgumentParser(description="Track internship applications.")
+    parser = argparse.ArgumentParser(description="Evaluate AI agent's effectiveness")
     sub = parser.add_subparsers(dest="cmd")
 
     sub.add_parser("evaluate", help="Go through unelabeled postings one by one")
