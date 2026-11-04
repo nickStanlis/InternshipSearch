@@ -22,8 +22,6 @@ import textwrap
 import webbrowser
 from datetime import date
 
-DB_PATH = "matches.db"
-
 STATUSES = {
     "applied": "Applied",
     "interviewing": "Interviewing",

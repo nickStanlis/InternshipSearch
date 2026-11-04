@@ -2,9 +2,9 @@ import os
 import re
 import json
 import time
-import sqlite3
 from datetime import date
-
+import db
+import hashlib
 import requests
 from dotenv import load_dotenv
 from google import genai
@@ -37,7 +37,7 @@ SECONDS_BETWEEN_CALLS = SETTINGS.get("seconds_between_gemini_calls", 4.5)
 MAX_EVALS_PER_RUN = SETTINGS.get("max_evaluations_per_run", 150)
 
 
-DB_PATH = "matches.db"
+
 RESULTS_PER_PAGE = 50
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -49,78 +49,6 @@ if not SEARCH_PLANS:
     raise SystemExit("No search_plans found under pipeline_settings in config.json")
 
 
-# ---------------------------------------------------------------------------
-# Database
-# ---------------------------------------------------------------------------
-def init_db(conn: sqlite3.Connection) -> None:
-    """Idempotent: safe to run every time. job_postings matches your init script."""
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS job_postings (
-            job_id TEXT PRIMARY KEY,
-            title TEXT,
-            company TEXT,
-            location TEXT,
-            term TEXT,
-            url TEXT UNIQUE,
-            fit_score INTEGER,
-            matched_major TEXT,
-            key_strengths TEXT,
-            date_logged TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            status TEXT DEFAULT 'Unreviewed'
-        )
-    """)
-    # Every job the pipeline has processed, match or not, so nothing is
-    # sent to Gemini twice.
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS seen_jobs (
-            job_id TEXT PRIMARY KEY,
-            title TEXT,
-            company TEXT,
-            outcome TEXT NOT NULL,      -- 'prefiltered_out' | 'evaluated'
-            is_match INTEGER,
-            fit_score INTEGER,
-            reasoning TEXT,
-            description TEXT,
-            first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(seen_jobs)")}
-    if "url" not in cols:
-        conn.execute("ALTER TABLE seen_jobs ADD COLUMN url TEXT")
-    if "description" not in cols:
-        conn.execute("ALTER TABLE seen_jobs ADD COLUMN description TEXT")
-    if "location" not in cols:
-        conn.execute("ALTER TABLE seen_jobs ADD COLUMN location TEXT" )
-    if "model" not in cols:
-        conn.execute("ALTER TABLE seen_jobs ADD COLUMN model TEXT")
-    conn.commit()
-
-
-def mark_seen(conn, job_id, title, company, location, outcome, url, description, model, ev=None) -> None:
-    conn.execute(
-        """INSERT OR IGNORE INTO seen_jobs
-   (job_id, title, company, location, outcome, url, description, model, is_match, fit_score, reasoning)
-   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            job_id, title, company, location, outcome, url, description, model,
-            int(ev.is_match) if ev else None,
-            ev.fit_score if ev else None,
-            ev.reasoning if ev else None,
-        ),
-    )
-
-
-def save_match(conn, job_id, title, company, location, url, ev) -> None:
-    conn.execute(
-        """INSERT OR IGNORE INTO job_postings
-           (job_id, title, company, location, term, url, fit_score, matched_major, key_strengths)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            job_id, title, company, location, ev.term,
-            url or None,  # NULL rather than '' so the UNIQUE constraint can't collide
-            ev.fit_score, ev.matched_major, ", ".join(ev.key_strengths),
-        ),
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +206,7 @@ Compute fit_score (0-100) using these weights:
 
 
 EVALUATION_RULES = build_evaluation_rules()
-
+PROMPT_VERSION = hashlib.sha256(EVALUATION_RULES.encode()).hexdigest()[:12]
 
 def evaluate_job(title: str, company: str, location: str, description: str) -> JobEvaluation:
     prompt = f"""{EVALUATION_RULES}
@@ -337,44 +265,46 @@ def run() -> None:
     if not all([GEMINI_API_KEY, ADZUNA_APP_ID, ADZUNA_APP_KEY]):
         raise SystemExit("Missing GEMINI_API_KEY, ADZUNA_APP_ID or ADZUNA_APP_KEY in .env")
 
-    conn = sqlite3.connect(DB_PATH)
-    init_db(conn)
+    conn = db.connect()
+    run_id = db.start_run(conn, model=MODEL_NAME, prompt_version=PROMPT_VERSION)
     stats = dict.fromkeys(
         ["fetched", "duplicates", "already_seen", "prefiltered_out",
          "evaluated", "matches", "errors", "deferred"], 0)
-
-    print(" Starting ingestion...")
+    run_status, run_error = "completed", None
+    print(f" Starting ingestion (run {run_id}, prompt {PROMPT_VERSION})...")
 
     # 1. Fetch every search and dedupe (remote jobs often appear in state searches too)
-    jobs: dict[str, dict] = {}
-    for plan in SEARCH_PLANS:
-        for job in fetch_all(plan):
-            stats["fetched"] += 1
-            job_id = str(job.get("id"))
-            if job_id in jobs:
-                stats["duplicates"] += 1
-                continue
-            jobs[job_id] = job
-
-    seen = {row[0] for row in conn.execute("SELECT job_id FROM seen_jobs")}
-    last_call = 0.0
-    quota_hit = False
-
     try:
+        jobs: dict[str, dict] = {}
+        for plan in SEARCH_PLANS:
+            for job in fetch_all(plan):
+                stats["fetched"] += 1
+                job_id = str(job.get("id"))
+                if job_id in jobs:
+                    stats["duplicates"] += 1
+                    continue
+                jobs[job_id] = job
+
+        seen = db.seen_job_ids(conn)
+        last_call = 0.0
+        quota_hit = False
+
+
         for job_id, job in jobs.items():
             if job_id in seen:
                 stats["already_seen"] += 1
                 continue
-
-            title = job.get("title", "")
-            company = job.get("company", {}).get("display_name", "Unknown")
-            description = job.get("description", "")
-            url = job.get("redirect_url", "")
-            location_name = job.get("location", {}).get("display_name", "Unknown")
-
+            posting = db.NewPosting(
+                job_id=job_id,
+                title = job.get("title", ""),
+                company = job.get("company", {}).get("display_name", "Unknown"),
+                description = job.get("description", ""),
+                url = job.get("redirect_url", ""),
+                location_name = job.get("location", {}).get("display_name", "Unknown"),
+            )
             # 2. Free local filter
-            if not prefilter_job(title, description):
-                mark_seen(conn, job_id, title, company, location_name,  "prefiltered_out",  url, description, None)
+            if not prefilter_job(posting.title, posting.description):
+                db.record_prefiltered(conn, posting)
                 stats["prefiltered_out"] += 1
                 continue
 
@@ -390,27 +320,32 @@ def run() -> None:
 
             # 4. LLM scoring
             try:
-                ev = evaluate_with_retry(title, company, location_name, description)
+                ev = evaluate_with_retry(posting.title, posting.company, posting.location_name, posting.description)
             except QuotaExhausted:
                 print("Stop Gemini daily quota exhausted; remaining jobs will be evaluated next run.")
                 quota_hit = True
                 stats["deferred"] += 1
                 continue
             except Exception as e:
-                print(f"   Warning Evaluation error on {job_id} ({title}): {e}")
+                print(f"   Warning Evaluation error on {job_id} ({posting.title}): {e}")
                 stats["errors"] += 1  # not marked seen, so it's retried next run
                 continue
 
+                # 5. Save the score, plus the posting itself if it's a strong match
+            is_strong_match = ev.is_match and ev.fit_score >= MIN_FIT_SCORE
+            db.record_scored(conn, posting, ev, model=MODEL_NAME, prompt_version=PROMPT_VERSION,
+                                 save_as_match=is_strong_match, run_id=run_id)
             stats["evaluated"] += 1
-            mark_seen(conn, job_id, title, company, location_name,"evaluated",   url,description, MODEL_NAME, ev)
-            if ev.is_match and ev.fit_score >= MIN_FIT_SCORE:
-                save_match(conn, job_id, title, company, location_name, url, ev)
+            if is_strong_match:
                 stats["matches"] += 1
-                print(f"   MATCH ({ev.fit_score}/100): {title} @ {company} [{location_name}]")
-            conn.commit()
-    finally:
-        conn.commit()
-        conn.close()
+                print(f"   MATCH ({ev.fit_score}/100): {posting.title} @ {posting.company} [{posting.location}]")
+
+    except KeyboardInterrupt:
+        run_status = "stopped"
+        print("\n Stopped by user; progress so far is saved.")
+    except Exception as e:
+        run_status, run_error = "failed", f"{type(e).__name__}: {e}"
+        raise
 
     print("\n Run finished")
     for key, value in stats.items():
