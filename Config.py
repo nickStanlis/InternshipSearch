@@ -29,6 +29,6 @@ class Config(BaseModel):
     search_and_matching_criteria: dict
     pipeline_settings: PipelineSettings
 
-def load_config(path: str = "config.json") -> Config:
+def load_config(path: str | Path = CONFIG_PATH) -> Config:
     with open(path) as f:
         return Config.model_validate(json.load(f))

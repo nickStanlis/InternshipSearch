@@ -345,7 +345,7 @@ def evaluate_with_retry(posting: db.NewPosting, emit: ProgressCallback,
                     raise QuotaExhausted(str(e)) from e
                 raise
             wait = 10 * 2 ** attempt
-            emit(ProgressEvent(f"   Time Gemini returned {code}; retrying in {wait}s..."))
+            emit(ProgressEvent("retry",f"   Time Gemini returned {code}; retrying in {wait}s..."))
             if stop.wait(wait):  # interruptible sleep: returns True as soon as Stop is pressed
                 raise Stopped()
 
