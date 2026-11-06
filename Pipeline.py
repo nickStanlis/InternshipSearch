@@ -54,9 +54,6 @@ def gemini_client() -> genai.Client:
 # Adzuna: `what` words are ANDed, `what_or` words are ORed.
 KEYWORDS_OR = SETTINGS.get("search_keywords_or", "software data analytics analyst python developer statistics quantitative")
 SEARCH_PLANS = SETTINGS.get("search_plans", [])
-if not SEARCH_PLANS:
-    raise SystemExit("No search_plans found under pipeline_settings in config.json")
-
 
 # ---------------------------------------------------------------------------
 # Progress reporting and run results
@@ -308,7 +305,7 @@ Company: {company}
 Listed location: {location}
 Description snippet: {description}
 """
-    response = gemini_client.models.generate_content(
+    response = gemini_client().models.generate_content(
         model=MODEL_NAME,
         contents=prompt,
         config=types.GenerateContentConfig(
@@ -348,7 +345,7 @@ def evaluate_with_retry(posting: db.NewPosting, emit: ProgressCallback,
                     raise QuotaExhausted(str(e)) from e
                 raise
             wait = 10 * 2 ** attempt
-            print(f"   Time Gemini returned {code}; retrying in {wait}s...")
+            emit(ProgressEvent(f"   Time Gemini returned {code}; retrying in {wait}s..."))
             if stop.wait(wait):  # interruptible sleep: returns True as soon as Stop is pressed
                 raise Stopped()
 
@@ -428,7 +425,7 @@ def run(on_progress: ProgressCallback | None = None,
         raise SystemExit("No search_plans found under pipeline_settings in config.json")
     emit = on_progress or (lambda event: None)
     stop = stop or threading.Event()  # never set unless the caller sets it
-
+    error = None
     conn = db.connect()
     summary = RunSummary(run_id=db.start_run(conn, model=MODEL_NAME, prompt_version=PROMPT_VERSION))
     emit(ProgressEvent("stage", f" Starting ingestion (run {summary.run_id}, prompt {PROMPT_VERSION})..."))

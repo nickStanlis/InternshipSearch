@@ -4,7 +4,7 @@ import textwrap
 import webbrowser
 
 import db
-from Tracker import connect
+
 
 ANSWERS = {"y": True, "n": False}
 
@@ -70,7 +70,7 @@ def cmd_evaluate(conn):
                 return
             if answer == "skip":
                 continue  # snippet label is kept; this job comes back next session
-            db.set_snippet_label(conn, job.job_id, ANSWERS[answer])
+            db.set_full_label(conn, job.job_id, ANSWERS[answer])
 
 
 def main():
@@ -81,7 +81,7 @@ def main():
 
     # No command (e.g. launched with an IDE's Run button) -> show the open list.
     args = parser.parse_args(sys.argv[1:] or ["evaluate"])
-    conn = connect()
+    conn = db.connect()
 
     try:
         if args.cmd == "evaluate":

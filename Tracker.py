@@ -1,4 +1,4 @@
-"""Track applications for jobs saved by job_matcher.py.
+"""Track applications for jobs saved by Pipeline.py.
 
 Usage:
   python tracker.py review               # walk through new postings one at a time
