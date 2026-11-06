@@ -1,8 +1,11 @@
 import os
 import re
 import json
+import threading
 import time
+from dataclasses import dataclass, asdict
 from datetime import date
+from typing import Callable
 import db
 import hashlib
 import requests
@@ -40,7 +43,13 @@ MAX_EVALS_PER_RUN = SETTINGS.get("max_evaluations_per_run", 150)
 
 RESULTS_PER_PAGE = 50
 
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+
+def gemini_client() -> genai.Client:
+    """Created on first use, so importing this module needs no API key (e.g. in tests)."""
+    global _gemini_client
+    if _gemini_client is None:
+        _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    return _gemini_client
 
 # Adzuna: `what` words are ANDed, `what_or` words are ORed.
 KEYWORDS_OR = SETTINGS.get("search_keywords_or", "software data analytics analyst python developer statistics quantitative")
@@ -49,6 +58,42 @@ if not SEARCH_PLANS:
     raise SystemExit("No search_plans found under pipeline_settings in config.json")
 
 
+# ---------------------------------------------------------------------------
+# Progress reporting and run results
+# ---------------------------------------------------------------------------
+@dataclass
+class ProgressEvent:
+    kind: str  # "stage", "fetched", "scored", "match", "retry", "warning", "info"
+    message: str  # human-readable; the CLI prints it, the UI logs it
+    done: int | None = None  # for progress bars, e.g. 12 of 40 scored
+    total: int | None = None
+
+
+ProgressCallback = Callable[[ProgressEvent], None]
+
+
+@dataclass
+class RunSummary:
+    run_id: int | None = None
+    status: str = "completed"  # "completed" | "stopped" | "failed"
+    fetched: int = 0
+    duplicates: int = 0
+    already_seen: int = 0
+    prefiltered_out: int = 0
+    evaluated: int = 0
+    matches: int = 0
+    errors: int = 0
+    deferred: int = 0
+
+    def counts(self) -> dict:
+        """Just the numbers, for db.finish_run and the end-of-run printout."""
+        d = asdict(self)
+        del d["run_id"], d["status"]
+        return d
+
+
+class Stopped(Exception):
+    """Raised when the stop event is set during a wait."""
 
 
 # ---------------------------------------------------------------------------
@@ -72,25 +117,64 @@ def fetch_adzuna_page(plan: dict, page: int) -> list[dict]:
     return res.json().get("results", [])
 
 
-def fetch_all(plan: dict) -> list[dict]:
+def fetch_plan(plan: dict, emit: ProgressCallback, stop: threading.Event) -> list[dict]:
+    """Every page of one search plan."""
     jobs = []
     for page in range(1, MAX_PAGES + 1):
+        if stop.is_set():
+            break
         try:
             results = fetch_adzuna_page(plan, page)
         except requests.HTTPError as e:
-            # Don't print the URL: it contains the API key.
+            # Don't show the URL: it contains the API key.
             code = e.response.status_code if e.response is not None else "?"
             hint = " (check ADZUNA_APP_ID / ADZUNA_APP_KEY in .env)" if code in (401, 403) else ""
-            print(f" Adzuna returned HTTP {code} ({plan['label']}, page {page}){hint}")
+            emit(ProgressEvent("warning", f" Adzuna returned HTTP {code} ({plan['label']}, page {page}){hint}"))
             break
         except requests.RequestException as e:
-            print(f" Adzuna request failed ({plan['label']}, page {page}): {type(e).__name__}")
+            emit(ProgressEvent("warning", f" Adzuna request failed ({plan['label']}, page {page}): {type(e).__name__}"))
             break
-        print(f"From Adzuna | {plan['label']} | page {page} | {len(results)} jobs")
+        emit(ProgressEvent("fetched", f"From Adzuna | {plan['label']} | page {page} | {len(results)} jobs"))
         jobs.extend(results)
         if len(results) < RESULTS_PER_PAGE:
             break
     return jobs
+
+
+def fetch_jobs(plans: list[dict], emit: ProgressCallback, stop: threading.Event) -> list[dict]:
+    """Raw Adzuna results for every search plan, duplicates included."""
+    jobs = []
+    for plan in plans:
+        jobs.extend(fetch_plan(plan, emit, stop))
+    return jobs
+
+
+def to_posting(job: dict) -> db.NewPosting:
+    """Adzuna JSON -> NewPosting. The only place that knows Adzuna's field names."""
+    return db.NewPosting(
+        job_id=str(job.get("id")),
+        title=job.get("title", ""),
+        company=job.get("company", {}).get("display_name", "Unknown"),
+        location=job.get("location", {}).get("display_name", "Unknown"),
+        url=job.get("redirect_url", ""),
+        description=job.get("description", ""),
+    )
+
+
+def dedupe(jobs: list[dict]) -> tuple[list[db.NewPosting], int]:
+    """Unique postings (first occurrence wins) and how many duplicates were dropped.
+    Remote jobs often show up in the state searches too."""
+    unique: dict[str, db.NewPosting] = {}
+    for job in jobs:
+        posting = to_posting(job)
+        unique.setdefault(posting.job_id, posting)
+    return list(unique.values()), len(jobs) - len(unique)
+
+
+def drop_seen(postings: list[db.NewPosting], seen_ids: set[str]) -> tuple[list[db.NewPosting], int]:
+    """Postings not processed in an earlier run, and how many were skipped."""
+    new = [p for p in postings if p.job_id not in seen_ids]
+    return new, len(postings) - len(new)
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +197,14 @@ def prefilter_job(title: str, description: str) -> bool:
     if INTERN_RE.search(title):
         return True                       # "Product Manager Intern" passes
     return bool(INTERN_RE.search(description)) and not SENIOR_RE.search(title)
+
+
+def split_prefilter(postings: list[db.NewPosting]) -> tuple[list[db.NewPosting], list[db.NewPosting]]:
+    """(keep, rejected) according to prefilter_job."""
+    keep, rejected = [], []
+    for p in postings:
+        (keep if prefilter_job(p.title, p.description) else rejected).append(p)
+    return keep, rejected
 
 
 # ---------------------------------------------------------------------------
@@ -239,10 +331,12 @@ class QuotaExhausted(Exception):
 RETRYABLE_CODES = {429, 500, 502, 503, 504}
 
 
-def evaluate_with_retry(*args, attempts: int = 4) -> JobEvaluation:
+
+def evaluate_with_retry(posting: db.NewPosting, emit: ProgressCallback,
+                        stop: threading.Event, attempts: int = 4) -> JobEvaluation:
     for attempt in range(attempts):
         try:
-            return evaluate_job(*args)
+            return evaluate_job(posting.title, posting.company, posting.location, posting.description)
         except errors.APIError as e:
             code = getattr(e, "code", None)
             if code not in RETRYABLE_CODES:
@@ -255,102 +349,135 @@ def evaluate_with_retry(*args, attempts: int = 4) -> JobEvaluation:
                 raise
             wait = 10 * 2 ** attempt
             print(f"   Time Gemini returned {code}; retrying in {wait}s...")
-            time.sleep(wait)
+            if stop.wait(wait):  # interruptible sleep: returns True as soon as Stop is pressed
+                raise Stopped()
 
 
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
-def run() -> None:
+Evaluator = Callable[[db.NewPosting, ProgressCallback, threading.Event], JobEvaluation]
+
+
+
+def score_and_save(conn, postings: list[db.NewPosting], summary: RunSummary,
+                   emit: ProgressCallback, stop: threading.Event,
+                   evaluate: Evaluator = evaluate_with_retry) -> None:
+    """Score postings with Gemini under the rate limit, per-run cap and daily quota,
+    and record each result. Postings that aren't scored stay unseen for next run.
+
+    `evaluate` is a parameter so tests can pass a fake instead of calling Gemini.
+    """
+    to_score = min(len(postings), MAX_EVALS_PER_RUN)
+    last_call = 0.0
+
+    for i, posting in enumerate(postings):
+        if summary.evaluated + summary.errors >= MAX_EVALS_PER_RUN:
+            summary.deferred += len(postings) - i
+            emit(ProgressEvent("info", f"Per-run cap of {MAX_EVALS_PER_RUN} reached; "
+                                       f"{len(postings) - i} postings deferred to next run."))
+            return
+
+        wait = SECONDS_BETWEEN_CALLS - (time.monotonic() - last_call)
+        if stop.is_set() or (wait > 0 and stop.wait(wait)):
+            summary.status = "stopped"
+            summary.deferred += len(postings) - i
+            return
+        last_call = time.monotonic()
+
+        try:
+            ev = evaluate(posting, emit, stop)
+        except Stopped:
+            summary.status = "stopped"
+            summary.deferred += len(postings) - i
+            return
+        except QuotaExhausted:
+            summary.deferred += len(postings) - i
+            emit(ProgressEvent("warning", "Gemini daily quota exhausted; "
+                                          "remaining jobs will be evaluated next run."))
+            return
+        except Exception as e:
+            summary.errors += 1  # not marked seen, so it's retried next run
+            emit(ProgressEvent("warning", f"   Evaluation error on {posting.job_id} ({posting.title}): {e}"))
+            continue
+
+        is_strong_match = ev.is_match and ev.fit_score >= MIN_FIT_SCORE
+        db.record_scored(conn, posting, ev, model=MODEL_NAME, prompt_version=PROMPT_VERSION,
+                         save_as_match=is_strong_match, run_id=summary.run_id)
+        summary.evaluated += 1
+        done = summary.evaluated + summary.errors
+        if is_strong_match:
+            summary.matches += 1
+            emit(ProgressEvent("match", f"   MATCH ({ev.fit_score}/100): {posting.title} @ "
+                                        f"{posting.company} [{posting.location}]", done, to_score))
+        else:
+            emit(ProgressEvent("scored", f"   scored {ev.fit_score}/100: {posting.title}", done, to_score))
+
+
+def run(on_progress: ProgressCallback | None = None,
+        stop: threading.Event | None = None) -> RunSummary:
+    """Fetch, dedupe, prefilter, score and save. Returns the run's summary.
+
+        on_progress: called with a ProgressEvent for everything worth showing.
+        stop:        set() it from another thread (e.g. a Stop button) to end the run
+                     early; work done so far is kept and the rest waits for next run.
+        """
     if not all([GEMINI_API_KEY, ADZUNA_APP_ID, ADZUNA_APP_KEY]):
         raise SystemExit("Missing GEMINI_API_KEY, ADZUNA_APP_ID or ADZUNA_APP_KEY in .env")
+    if not SEARCH_PLANS:
+        raise SystemExit("No search_plans found under pipeline_settings in config.json")
+    emit = on_progress or (lambda event: None)
+    stop = stop or threading.Event()  # never set unless the caller sets it
 
     conn = db.connect()
-    run_id = db.start_run(conn, model=MODEL_NAME, prompt_version=PROMPT_VERSION)
-    stats = dict.fromkeys(
-        ["fetched", "duplicates", "already_seen", "prefiltered_out",
-         "evaluated", "matches", "errors", "deferred"], 0)
-    run_status, run_error = "completed", None
-    print(f" Starting ingestion (run {run_id}, prompt {PROMPT_VERSION})...")
-
+    summary = RunSummary(run_id=db.start_run(conn, model=MODEL_NAME, prompt_version=PROMPT_VERSION))
+    emit(ProgressEvent("stage", f" Starting ingestion (run {summary.run_id}, prompt {PROMPT_VERSION})..."))
     # 1. Fetch every search and dedupe (remote jobs often appear in state searches too)
     try:
-        jobs: dict[str, dict] = {}
-        for plan in SEARCH_PLANS:
-            for job in fetch_all(plan):
-                stats["fetched"] += 1
-                job_id = str(job.get("id"))
-                if job_id in jobs:
-                    stats["duplicates"] += 1
-                    continue
-                jobs[job_id] = job
+        raw = fetch_jobs(SEARCH_PLANS, emit, stop)
+        summary.fetched = len(raw)
 
-        seen = db.seen_job_ids(conn)
-        last_call = 0.0
-        quota_hit = False
+        # 2. Dedupe, then skip anything processed in an earlier run
+        postings, summary.duplicates = dedupe(raw)
+        postings, summary.already_seen = drop_seen(postings, db.seen_job_ids(conn))
 
+        # 3. Free local filter
+        keep, rejected = split_prefilter(postings)
+        for posting in rejected:
+            db.record_prefiltered(conn, posting)
+        summary.prefiltered_out = len(rejected)
+        emit(ProgressEvent("stage", f" {len(keep)} postings to score with Gemini"))
 
-        for job_id, job in jobs.items():
-            if job_id in seen:
-                stats["already_seen"] += 1
-                continue
-            posting = db.NewPosting(
-                job_id=job_id,
-                title = job.get("title", ""),
-                company = job.get("company", {}).get("display_name", "Unknown"),
-                description = job.get("description", ""),
-                url = job.get("redirect_url", ""),
-                location_name = job.get("location", {}).get("display_name", "Unknown"),
-            )
-            # 2. Free local filter
-            if not prefilter_job(posting.title, posting.description):
-                db.record_prefiltered(conn, posting)
-                stats["prefiltered_out"] += 1
-                continue
+        # 4 + 5. Score and save
+        if stop.is_set():
+            summary.status = "stopped"
+            summary.deferred += len(keep)
+        else:
+            score_and_save(conn, keep, summary, emit, stop)
 
-            # 3. Respect quota and per-run cap; deferred jobs stay unseen for next run
-            if quota_hit or stats["evaluated"] + stats["errors"] >= MAX_EVALS_PER_RUN:
-                stats["deferred"] += 1
-                continue
-
-            wait = SECONDS_BETWEEN_CALLS - (time.monotonic() - last_call)
-            if wait > 0:
-                time.sleep(wait)
-            last_call = time.monotonic()
-
-            # 4. LLM scoring
-            try:
-                ev = evaluate_with_retry(posting.title, posting.company, posting.location_name, posting.description)
-            except QuotaExhausted:
-                print("Stop Gemini daily quota exhausted; remaining jobs will be evaluated next run.")
-                quota_hit = True
-                stats["deferred"] += 1
-                continue
-            except Exception as e:
-                print(f"   Warning Evaluation error on {job_id} ({posting.title}): {e}")
-                stats["errors"] += 1  # not marked seen, so it's retried next run
-                continue
-
-                # 5. Save the score, plus the posting itself if it's a strong match
-            is_strong_match = ev.is_match and ev.fit_score >= MIN_FIT_SCORE
-            db.record_scored(conn, posting, ev, model=MODEL_NAME, prompt_version=PROMPT_VERSION,
-                                 save_as_match=is_strong_match, run_id=run_id)
-            stats["evaluated"] += 1
-            if is_strong_match:
-                stats["matches"] += 1
-                print(f"   MATCH ({ev.fit_score}/100): {posting.title} @ {posting.company} [{posting.location}]")
-
-    except KeyboardInterrupt:
-        run_status = "stopped"
-        print("\n Stopped by user; progress so far is saved.")
+        if summary.status == "stopped":
+            emit(ProgressEvent("stage", " Stopped; progress so far is saved."))
+    except KeyboardInterrupt:  # Ctrl+C in the terminal
+        summary.status = "stopped"
+        emit(ProgressEvent("stage", "\n Stopped by user; progress so far is saved."))
     except Exception as e:
-        run_status, run_error = "failed", f"{type(e).__name__}: {e}"
+        summary.status, error = "failed", f"{type(e).__name__}: {e}"
         raise
+    finally:
+        db.finish_run(conn, summary.run_id, status=summary.status,
+                      stats=summary.counts(), error=error)
+        conn.close()
 
-    print("\n Run finished")
-    for key, value in stats.items():
-        print(f"   {key.replace('_', ' '):<16} {value}")
+    return summary
+
+
+def print_progress(event: ProgressEvent) -> None:
+    """The CLI's progress callback."""
+    print(event.message)
 
 
 if __name__ == "__main__":
-    run()
+    result = run(on_progress=print_progress)
+    print(f"\n Run {result.status}")
+    for key, value in result.counts().items():
+        print(f"   {key.replace('_', ' '):<16} {value}")
