@@ -13,13 +13,14 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types, errors
 from pydantic import BaseModel, Field
+from Config import CONFIG_PATH
 
 load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-with open("config.json", "r") as f:
+with open(CONFIG_PATH, "r") as f:
     CONFIG = json.load(f)
 
 PROFILE = CONFIG.get("candidate_profile", {})
@@ -345,7 +346,7 @@ def evaluate_with_retry(posting: db.NewPosting, emit: ProgressCallback,
                     raise QuotaExhausted(str(e)) from e
                 raise
             wait = 10 * 2 ** attempt
-            emit(ProgressEvent("retry",f"   Time Gemini returned {code}; retrying in {wait}s..."))
+            emit(ProgressEvent("retry",f"Time Gemini returned {code}; retrying in {wait}s..."))
             if stop.wait(wait):  # interruptible sleep: returns True as soon as Stop is pressed
                 raise Stopped()
 

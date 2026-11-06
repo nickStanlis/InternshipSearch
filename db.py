@@ -113,6 +113,7 @@ class SeenJob:
     first_seen: str | None
     snippet_label: bool | None  # True = match, False = not a match, None = unlabeled
     full_label: bool | None
+    audit_sampled_at: str | None = None  # set when drawn into the prefilter audit sample
 
 
 @dataclass(slots=True)
@@ -156,6 +157,7 @@ class Run:
     prompt_version: str | None
     stats: dict = field(default_factory=dict)
     error: str | None = None
+    kind: str = "pipeline"  # 'pipeline' | 'rescore'
 
 
 class EvaluationLike(Protocol):
@@ -340,7 +342,19 @@ def _m3_notes(conn) -> None:
             [(job_id, created, body.strip()) for created, body in parsed if body.strip()])
 
 
-_MIGRATIONS = [_m1_baseline, _m2_runs_and_evaluations, _m3_notes]
+def _m4_audit_and_run_kind(conn) -> None:
+    """Prefilter audit sampling, and tell pipeline runs apart from rescore runs.
+
+    audit_sampled_at is set only on prefiltered postings drawn at random into
+    the audit sample, so the audit's miss rate is computed from a fair sample
+    rather than from whichever postings happened to get looked at.
+    """
+    _add_column(conn, "seen_jobs", "audit_sampled_at", "TEXT")
+    _add_column(conn, "runs", "kind", "TEXT NOT NULL DEFAULT 'pipeline'")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_seen_audit ON seen_jobs(audit_sampled_at)")
+
+
+_MIGRATIONS = [_m1_baseline, _m2_runs_and_evaluations, _m3_notes, _m4_audit_and_run_kind]
 SCHEMA_VERSION = len(_MIGRATIONS)
 
 
@@ -376,6 +390,7 @@ def _seen_job(row: sqlite3.Row) -> SeenJob:
         description=row["description"], outcome=row["outcome"], first_seen=row["first_seen"],
         snippet_label=_DB_TO_LABEL.get(row["training_status_description"]),
         full_label=_DB_TO_LABEL.get(row["training_status_url"]),
+        audit_sampled_at=row["audit_sampled_at"],
     )
 
 
@@ -394,6 +409,7 @@ def _run(row: sqlite3.Row) -> Run:
         id=row["id"], started_at=row["started_at"], finished_at=row["finished_at"],
         status=row["status"], model=row["model"], prompt_version=row["prompt_version"],
         stats=json.loads(row["stats"]) if row["stats"] else {}, error=row["error"],
+        kind=row["kind"],
     )
 
 
@@ -480,10 +496,12 @@ def record_evaluation(conn, job_id: str, ev: EvaluationLike, *, model: str,
         return _upsert_evaluation(conn, job_id, ev, model, prompt_version, run_id)
 
 
-def start_run(conn, *, model: str | None, prompt_version: str | None) -> int:
+def start_run(conn, *, model: str | None, prompt_version: str | None,
+              kind: str = "pipeline") -> int:
+    """kind: 'pipeline' for a normal fetch-and-score run, 'rescore' for re-scoring labels."""
     with conn:
-        cur = conn.execute("INSERT INTO runs (model, prompt_version) VALUES (?, ?)",
-                           (model, prompt_version))
+        cur = conn.execute("INSERT INTO runs (model, prompt_version, kind) VALUES (?, ?, ?)",
+                           (model, prompt_version, kind))
         return cur.lastrowid
 
 
@@ -495,8 +513,13 @@ def finish_run(conn, run_id: int, *, status: str, stats: dict, error: str | None
             "WHERE id = ?", (status, json.dumps(stats), error, run_id))
 
 
-def list_runs(conn, limit: int = 50) -> list[Run]:
-    rows = conn.execute("SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+def list_runs(conn, limit: int = 50, kind: str | None = None) -> list[Run]:
+    """Most recent runs first; pass kind='pipeline' or 'rescore' to show only one type."""
+    if kind:
+        rows = conn.execute("SELECT * FROM runs WHERE kind = ? ORDER BY id DESC LIMIT ?",
+                            (kind, limit)).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     return [_run(r) for r in rows]
 
 
@@ -640,14 +663,96 @@ def set_full_label(conn, job_id: str, is_match: bool | None) -> None:
                      (_LABEL_TO_DB[is_match], job_id))
 
 
-def labeled_jobs(conn) -> list[SeenJob]:
-    """Postings with at least one hand label: the test set for re-scoring with a new prompt."""
+def labeled_jobs(conn, outcome: str | None = "evaluated") -> list[SeenJob]:
+    """Postings with at least one hand label: the test set for re-scoring with a new prompt.
+
+    By default only postings that went through Gemini; audited prefiltered postings
+    are measured separately. Pass outcome=None for both.
+    """
+    query = _SEEN_SELECT + """
+        WHERE (training_status_description IN ('Valid', 'Invalid')
+               OR training_status_url IN ('Valid', 'Invalid'))"""
+    params: list = []
+    if outcome:
+        query += " AND outcome = ?"
+        params.append(outcome)
+    return [_seen_job(r) for r in conn.execute(query + " ORDER BY rowid", params)]
+
+
+def scored_job_ids(conn, model: str, prompt_version: str) -> set[str]:
+    """job_ids that already have a score from this exact model + prompt version."""
+    return {r[0] for r in conn.execute(
+        "SELECT job_id FROM evaluations WHERE model = ? AND prompt_version = ?",
+        (model, prompt_version))}
+
+
+# ---------------------------------------------------------------------------
+# Prefilter audit: a random sample of postings the regex prefilter rejected
+# ---------------------------------------------------------------------------
+def _audit_window(within_days: int | None) -> tuple[str, list]:
+    if within_days is None:
+        return "", []
+    return " AND first_seen >= datetime('now', ?)", [f"-{int(within_days)} days"]
+
+
+def unsampled_prefiltered_ids(conn, within_days: int | None = None) -> list[str]:
+    """Prefiltered postings not yet drawn into the audit sample (optionally only recent ones)."""
+    clause, params = _audit_window(within_days)
+    return [r[0] for r in conn.execute(
+        "SELECT job_id FROM seen_jobs WHERE outcome = 'prefiltered_out' "
+        "AND audit_sampled_at IS NULL" + clause + " ORDER BY rowid", params)]
+
+
+def mark_audit_sampled(conn, job_ids: Iterable[str]) -> int:
+    """Add postings to the audit sample. The random choice is made by the caller."""
+    with conn:
+        cur = conn.executemany(
+            "UPDATE seen_jobs SET audit_sampled_at = CURRENT_TIMESTAMP "
+            "WHERE job_id = ? AND outcome = 'prefiltered_out' AND audit_sampled_at IS NULL",
+            [(j,) for j in job_ids])
+    return cur.rowcount
+
+
+def audit_queue(conn) -> list[SeenJob]:
+    """Sampled prefiltered postings still missing a label, in the order they were drawn."""
     rows = conn.execute(
         _SEEN_SELECT + """
-        WHERE training_status_description IN ('Valid', 'Invalid')
-           OR training_status_url IN ('Valid', 'Invalid')
-        ORDER BY rowid""")
+        WHERE audit_sampled_at IS NOT NULL
+          AND (COALESCE(training_status_description, 'Unlabeled') = 'Unlabeled'
+               OR COALESCE(training_status_url, 'Unlabeled') = 'Unlabeled')
+        ORDER BY audit_sampled_at, rowid""")
     return [_seen_job(r) for r in rows]
+
+
+def audit_jobs(conn) -> list[SeenJob]:
+    """Every posting in the audit sample, labeled or not."""
+    rows = conn.execute(_SEEN_SELECT + " WHERE audit_sampled_at IS NOT NULL "
+                                       "ORDER BY audit_sampled_at, rowid")
+    return [_seen_job(r) for r in rows]
+
+
+def prefiltered_count(conn) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) FROM seen_jobs WHERE outcome = 'prefiltered_out'").fetchone()[0]
+
+
+def label_counts(conn, *, audit: bool = False) -> dict[str, int]:
+    """How far labeling has got, for progress bars.
+
+    audit=False: postings scored by Gemini. audit=True: the prefilter audit sample.
+    Returns {'total', 'fully_labeled', 'snippet_only', 'unlabeled'}.
+    """
+    where = "audit_sampled_at IS NOT NULL" if audit else "outcome = 'evaluated'"
+    row = conn.execute(f"""
+        SELECT COUNT(*),
+               SUM(training_status_description IN ('Valid', 'Invalid')
+                   AND training_status_url IN ('Valid', 'Invalid')),
+               SUM(training_status_description IN ('Valid', 'Invalid')
+                   AND COALESCE(training_status_url, 'Unlabeled') = 'Unlabeled')
+        FROM seen_jobs WHERE {where}""").fetchone()
+    total, full, snippet_only = row[0], row[1] or 0, row[2] or 0
+    return {"total": total, "fully_labeled": full, "snippet_only": snippet_only,
+            "unlabeled": total - full - snippet_only}
 
 
 def list_evaluations(conn, job_id: str) -> list[Evaluation]:
@@ -664,10 +769,14 @@ def evaluation_versions(conn) -> list[tuple[str, str, int]]:
            GROUP BY model, prompt_version ORDER BY MAX(created_at) DESC""")]
 
 
-def labeled_evaluations(conn, *, model: str | None = None,
-                        prompt_version: str | None = None) -> list[LabeledEvaluation]:
+def labeled_evaluations(conn, *, model: str | None = None, prompt_version: str | None = None,
+                        outcome: str | None = "evaluated") -> list[LabeledEvaluation]:
     """Model decisions joined with your labels, optionally for one model/prompt version.
-    This is the input for precision/recall and confusion-matrix calculations."""
+    This is the input for precision/recall and confusion-matrix calculations.
+
+    Only postings that passed the prefilter by default, so scoring audited prefiltered
+    postings later can't skew the model's numbers. Pass outcome=None to include them.
+    """
     query = """
         SELECT e.job_id, s.title, s.company, e.model, e.prompt_version, e.is_match,
                e.fit_score, s.training_status_description, s.training_status_url
@@ -675,6 +784,9 @@ def labeled_evaluations(conn, *, model: str | None = None,
         WHERE (s.training_status_description IN ('Valid', 'Invalid')
                OR s.training_status_url IN ('Valid', 'Invalid'))"""
     params: list = []
+    if outcome:
+        query += " AND s.outcome = ?"
+        params.append(outcome)
     if model:
         query += " AND e.model = ?"
         params.append(model)
