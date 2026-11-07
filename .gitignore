@@ -9,9 +9,13 @@
 *.db-shm
 # Python / IDE files
 __pycache__/
+.pytest_cache/
 *.py[cod]
 .idea/
 .venv/
 venv/
 .vscode/
 config.json
+
+# NiceGUI storage
+.nicegui/
