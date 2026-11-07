@@ -1,6 +1,8 @@
 """Home page: what needs your attention, where applications stand, and the last run."""
 from __future__ import annotations
 
+from urllib.parse import quote
+
 from nicegui import PageArguments, ui
 
 import db
@@ -36,7 +38,7 @@ def content() -> None:
         (audit.remaining, word(audit.remaining, "audit posting") + " to label",
          "Open audit", "/label?tab=audit"),
         (tracker.unreviewed, word(tracker.unreviewed, "new match", "new matches") + " to review",
-         None, None),  # the Review page comes later
+         "Open review", "/review"),
     ]
     with ui.element("div").classes("panel w-full q-mb-xl"):
         waiting = [r for r in rows if r[0]]
@@ -47,11 +49,8 @@ def content() -> None:
             with ui.row().classes("todo-row w-full items-center no-wrap"):
                 ui.label(str(count)).classes("todo-count")
                 ui.label(text).classes("col")
-                if target:
-                    ui.button(button, on_click=lambda t=target: ui.navigate.to(t)) \
-                        .props("unelevated no-caps")
-                else:
-                    ui.label("Review page coming soon").classes("t-small")
+                ui.button(button, on_click=lambda t=target: ui.navigate.to(t)) \
+                    .props("unelevated no-caps")
 
     # --- Applications ---------------------------------------------------------
     ui.label("Applications").classes("t-h2 q-mb-sm")
@@ -60,9 +59,9 @@ def content() -> None:
             ui.label("No saved matches yet. Gemini saves postings that score above your threshold.") \
                 .classes("t-soft")
         else:
-            with ui.row().classes("w-full no-wrap gap-0 stages").props('role="list"'):
+            with ui.row().classes("w-full no-wrap gap-0 stages"):
                 for status in STAGES:
-                    with ui.element("div").classes("stage").props('role="listitem"'):
+                    with ui.link(target=f"/tracker?status={quote(status)}").classes("stage"):
                         ui.label(str(tracker.counts.get(status, 0))).classes("stage-count")
                         ui.label(status).classes("t-soft")
             closed = ", ".join(f"{tracker.counts[s]} {s.lower()}"

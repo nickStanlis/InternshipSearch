@@ -151,3 +151,107 @@ def test_audit_draw_rejects_out_of_range_count(demo_db):
     c = db.connect(demo_db)
     assert db.label_counts(c, audit=True)["total"] == 0
     c.close()
+
+
+def posting(path, job_id):
+    c = db.connect(path)
+    try:
+        return db.get_posting(c, job_id)
+    finally:
+        c.close()
+
+
+# ---------------------------------------------------------------------------
+# Review
+# ---------------------------------------------------------------------------
+def test_review_shows_gemini_reasoning(demo_db):
+    async def scenario(user):
+        await user.open("/review")
+        await user.should_see("Gemini's fit score: 88 of 100")
+        await user.should_see("Fits the analytics focus.")
+    run(scenario)
+
+
+def test_review_applied_with_note_then_undo(demo_db):
+    async def scenario(user):
+        await user.open("/review")
+        user.find(ui.textarea).type("Applied through the portal")
+        press(user, "a")
+        await user.should_see("Marked Data Analytics Intern, Summer 2027 as Applied.")
+        p = posting(demo_db, "d1")
+        assert p.status == db.APPLIED and p.applied_date
+        c = db.connect(demo_db)
+        assert [n.body for n in db.list_notes(c, "d1")] == ["Applied through the portal"]
+        c.close()
+        press(user, "u")
+        await user.should_see("Undid the decision")
+    run(scenario)
+    p = posting(demo_db, "d1")
+    assert (p.status, p.applied_date) == (db.UNREVIEWED, None)
+    c = db.connect(demo_db)
+    assert db.list_notes(c, "d1") == []
+    c.close()
+
+
+def test_review_not_interested_and_skip(demo_db):
+    async def scenario(user):
+        await user.open("/review")
+        press(user, "n")
+        await user.should_see("as Not Interested.")
+        press(user, "s")
+        await user.should_see("Left ")
+    run(scenario)
+    assert posting(demo_db, "d1").status == db.NOT_INTERESTED
+    assert posting(demo_db, "d5").status == db.UNREVIEWED  # skipped, not changed
+
+
+# ---------------------------------------------------------------------------
+# Tracker
+# ---------------------------------------------------------------------------
+def test_tracker_lists_open_postings_and_filters_by_status(demo_db):
+    async def scenario(user):
+        await user.open("/tracker")
+        table = user.find(ui.table).elements.pop()
+        assert {r["job_id"] for r in table.rows} == {"d1", "d2", "d3", "d5"}
+        await user.open("/tracker?status=Applied")
+        table = user.find(ui.table).elements.pop()
+        assert [r["job_id"] for r in table.rows] == ["d2"]
+    run(scenario)
+
+
+def test_tracker_ignores_unknown_status_filter(demo_db):
+    async def scenario(user):
+        await user.open("/tracker?status=<script>")
+        table = user.find(ui.table).elements.pop()
+        assert len(table.rows) == 4  # fell back to Open
+    run(scenario)
+
+
+def test_tracker_detail_change_status_and_notes(demo_db):
+    async def scenario(user):
+        await user.open("/tracker")
+        user.find(ui.table).trigger("open", "d3")
+        await user.should_see("Harbor Point Capital, Chicago, IL")
+        user.find(ui.textarea).type("Recruiter call Friday")
+        user.find("Add note").click()
+        await user.should_see("Recruiter call Friday")
+        status = [s for s in user.find(ui.select).elements if s.value == db.UNREVIEWED][0]
+        status.value = db.INTERVIEWING
+        await user.should_see("Status changed to Interviewing.")
+    run(scenario)
+    assert posting(demo_db, "d3").status == db.INTERVIEWING
+
+
+def test_tracker_bulk_status(demo_db):
+    async def scenario(user):
+        await user.open("/tracker")
+        table = user.find(ui.table).elements.pop()
+        rows = [r for r in table.rows if r["job_id"] in ("d1", "d3")]
+        user.find(ui.table).trigger("selection", {"added": True, "rows": rows, "keys": ["d1", "d3"]})
+        await user.should_see("2 postings selected.")
+        bulk = [s for s in user.find(ui.select).elements if s.props.get("label") == "Set status to"][0]
+        bulk.value = db.NOT_INTERESTED
+        user.find("Apply to selected").click()
+        await user.should_see("Set 2 postings to Not Interested.")
+    run(scenario)
+    assert posting(demo_db, "d1").status == posting(demo_db, "d3").status == db.NOT_INTERESTED

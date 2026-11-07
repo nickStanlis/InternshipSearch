@@ -12,11 +12,11 @@ Keys: Y match, N not a match, S skip, U undo, O open the full posting (full step
 from __future__ import annotations
 
 from nicegui import PageArguments, ui
-from nicegui.events import KeyEventArguments
 
 import labeling
 from labeling import AUDIT, FULL, LABELING, SNIPPET
-from gui.components import external_link, keycap, open_in_new_tab, plural, posting_card, run_action
+from gui.components import (external_link, keycap, open_in_new_tab, plural, posting_card, run_action,
+                            shortcuts)
 from gui.data import conn
 
 MAX_DRAW = 200
@@ -47,12 +47,13 @@ def page(args: PageArguments) -> None:
             AuditControls(on_draw=lambda: panels[AUDIT].reload())
             panels[AUDIT] = LabelingPanel(AUDIT)
 
-    def on_key(e: KeyEventArguments) -> None:
+    def active() -> LabelingPanel:
         current = tabs.value if isinstance(tabs.value, str) else getattr(tabs.value, "_props", {}).get("name")
-        panels[current or LABELING].handle_key(e)
+        return panels[current or LABELING]
 
-    # 'button' is left out of ignore so shortcuts keep working after a mouse click.
-    ui.keyboard(on_key=on_key, ignore=["input", "select", "textarea"])
+    shortcuts({"y": lambda: active().submit(True), "n": lambda: active().submit(False),
+               "s": lambda: active().skip(), "u": lambda: active().undo(),
+               "o": lambda: active().open_posting()})
 
 
 class LabelingPanel:
@@ -115,17 +116,6 @@ class LabelingPanel:
     def open_posting(self) -> None:
         if self.task is not None and self.task.step == FULL:
             open_in_new_tab(self.task.url)
-
-    def handle_key(self, e: KeyEventArguments) -> None:
-        if not e.action.keydown or e.action.repeat:
-            return
-        if e.modifiers.ctrl or e.modifiers.meta or e.modifiers.alt:
-            return  # leave browser shortcuts like Ctrl+U alone
-        actions = {"y": lambda: self.submit(True), "n": lambda: self.submit(False),
-                   "s": self.skip, "u": self.undo, "o": self.open_posting}
-        action = actions.get(str(e.key.name).lower())
-        if action:
-            action()
 
     # --- view -----------------------------------------------------------------
     def render(self) -> None:

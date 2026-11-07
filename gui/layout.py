@@ -9,14 +9,14 @@ from typing import Callable
 
 from nicegui import PageArguments, ui
 
-from gui import dashboard, labeling_page, theme
+from gui import dashboard, labeling_page, review_page, theme, tracker_page
 
 # (path, nav label, page builder or None while the page isn't built yet)
 PAGES: list[tuple[str, str, Callable[[PageArguments], None] | None]] = [
     ("/", "Home", dashboard.page),
     ("/label", "Labeling", labeling_page.page),
-    ("/tracker", "Tracker", None),
-    ("/review", "Review", None),
+    ("/review", "Review", review_page.page),
+    ("/tracker", "Tracker", tracker_page.page),
     ("/metrics", "Metrics", None),
     ("/runs", "Runs", None),
     ("/settings", "Settings", None),

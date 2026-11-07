@@ -96,6 +96,26 @@ body {{ background: var(--paper); color: var(--ink); font-size: 16px; line-heigh
 .keycap.quiet .keycap-key {{ font-size: 15px; width: 1.625rem; height: 1.625rem; line-height: 1.625rem; }}
 .keycap.quiet .keycap-text {{ font-size: 15px; font-weight: 400; }}
 
+/* Tracker */
+.tracker-table thead th {{ font-weight: 700; font-size: 13px; color: var(--ink-soft); }}
+.tracker-table tbody tr {{ cursor: pointer; }}
+.tracker-open {{ font-weight: 700; text-align: left; }}
+.tracker-open .q-btn__content {{ justify-content: flex-start; text-align: left; }}
+.q-dialog__inner--right {{ padding: 0 !important; }}
+.detail-panel {{ width: min(34rem, 100vw); max-width: 100vw !important; height: 100%;
+  max-height: 100vh !important; border-radius: 0 !important; overflow-y: auto; }}
+.detail-heading {{ font-weight: 700; margin-top: 1.5rem; padding-top: 1rem; margin-bottom: .375rem;
+  border-top: 1px solid var(--rule); width: 100%; }}
+.detail-text {{ white-space: pre-wrap; overflow-wrap: anywhere; max-width: 68ch; }}
+.note {{ padding: .625rem 0; border-bottom: 1px solid var(--rule); }}
+
+/* Review: Gemini's view sits beside the posting, marked by a rule rather than a box */
+.gemini-note {{ border-left: 3px solid var(--ink); padding: .25rem 0 .25rem 1rem; }}
+
+/* Dashboard stages link to the tracker */
+a.stage {{ color: inherit; text-decoration: none; border-radius: 6px; }}
+a.stage:hover {{ background: var(--paper); }}
+
 @media (max-width: 640px) {{
   .nicegui-content {{ padding: 1.25rem 1rem; }}
   .keycap {{ min-width: 0; flex: 1 1 auto; }}

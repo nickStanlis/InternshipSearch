@@ -54,17 +54,23 @@ def summary(conn) -> TrackerSummary:
 class ReviewItem:
     posting: db.Posting
     remaining: int  # unreviewed postings left, including this one (skipped ones excluded)
+    snippet: str | None = None  # the stored description Gemini scored
 
 
-def next_for_review(conn, skip: Iterable[str] = ()) -> ReviewItem | None:
+def next_for_review(conn, skip: Iterable[str] = (), prefer: str | None = None) -> ReviewItem | None:
     """The next posting to review, or None when done.
 
     `skip` holds job_ids passed over this session ("decide later"); they stay
-    Unreviewed and come back next session.
+    Unreviewed and come back next session. `prefer` puts one posting first if it's
+    still unreviewed (e.g. right after undoing a decision on it).
     """
     skip = set(skip)
     queue = [p for p in db.review_queue(conn) if p.job_id not in skip]
-    return ReviewItem(queue[0], len(queue)) if queue else None
+    if not queue:
+        return None
+    first = next((p for p in queue if p.job_id == prefer), queue[0])
+    seen = db.get_seen_job(conn, first.job_id)
+    return ReviewItem(first, len(queue), seen.description if seen else None)
 
 
 # ---------------------------------------------------------------------------
@@ -87,9 +93,10 @@ def set_status(conn, job_ids: Iterable[str], status: str) -> int:
 def mark_applied(conn, job_id: str, note: str | None = None) -> db.Posting:
     """Mark Applied (applied_date is recorded the first time) and optionally add a note."""
     _require(conn, job_id)
+    body = _clean_note(note) if note and note.strip() else None  # validate before changing anything
     db.set_status(conn, [job_id], db.APPLIED)
-    if note and note.strip():
-        db.add_note(conn, job_id, note)
+    if body:
+        db.add_note(conn, job_id, body)
     return db.get_posting(conn, job_id)
 
 
@@ -99,11 +106,67 @@ def mark_not_interested(conn, job_id: str) -> db.Posting:
     return db.get_posting(conn, job_id)
 
 
+MAX_NOTE_LENGTH = 5000
+
+
+def _clean_note(body: str) -> str:
+    body = (body or "").strip()
+    if not body:
+        raise TrackingError("Note is empty")
+    if len(body) > MAX_NOTE_LENGTH:
+        raise TrackingError(f"Notes can be at most {MAX_NOTE_LENGTH:,} characters "
+                            f"(this one is {len(body):,}).")
+    return body
+
+
 def add_note(conn, job_id: str, body: str) -> db.Note:
     _require(conn, job_id)
-    if not body.strip():
-        raise TrackingError("Note is empty")
-    return db.add_note(conn, job_id, body)
+    return db.add_note(conn, job_id, _clean_note(body))
+
+
+def _require_note(conn, job_id: str, note_id: int) -> db.Note:
+    note = next((n for n in db.list_notes(conn, job_id) if n.id == note_id), None)
+    if note is None:
+        raise TrackingError("That note no longer exists.")
+    return note
+
+
+def edit_note(conn, job_id: str, note_id: int, body: str) -> None:
+    """Change a note's text. job_id makes sure the note belongs to that posting."""
+    _require_note(conn, job_id, note_id)
+    db.update_note(conn, note_id, _clean_note(body))
+
+
+def delete_note(conn, job_id: str, note_id: int) -> db.Note:
+    """Delete a note; returns it so the UI can offer to restore it."""
+    note = _require_note(conn, job_id, note_id)
+    db.delete_note(conn, note_id)
+    return note
+
+
+# ---------------------------------------------------------------------------
+# Undo
+# ---------------------------------------------------------------------------
+@dataclass(slots=True)
+class StatusSnapshot:
+    """A posting's status fields before a change, so the change can be undone."""
+    job_id: str
+    status: str
+    applied_date: str | None
+    status_updated: str | None
+
+
+def snapshot(conn, job_id: str) -> StatusSnapshot:
+    p = _require(conn, job_id)
+    return StatusSnapshot(job_id, p.status, p.applied_date, p.status_updated)
+
+
+def restore(conn, snap: StatusSnapshot) -> db.Posting:
+    """Undo a status change, including any applied_date it recorded."""
+    _require(conn, snap.job_id)
+    db.restore_status(conn, snap.job_id, status=snap.status, applied_date=snap.applied_date,
+                      status_updated=snap.status_updated)
+    return db.get_posting(conn, snap.job_id)
 
 
 # ---------------------------------------------------------------------------

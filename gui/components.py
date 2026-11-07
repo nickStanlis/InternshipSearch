@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from nicegui import ui
+from nicegui.events import KeyEventArguments
 
 from labeling import LabelingError
 from tracking import TrackingError
@@ -84,6 +85,44 @@ def keycap(key: str, text: str, on_click: Callable[[], Any], tone: str = "quiet"
         ui.label(text).classes("keycap-text")
     button.props(f'aria-keyshortcuts="{key.lower()}"')
     return button
+
+
+def shortcut_key(e: KeyEventArguments) -> str | None:
+    """The plain letter pressed, or None for key-ups, repeats and Ctrl/Alt/Cmd combos
+    (so browser shortcuts like Ctrl+U are left alone)."""
+    if not e.action.keydown or e.action.repeat:
+        return None
+    if e.modifiers.ctrl or e.modifiers.meta or e.modifiers.alt:
+        return None
+    return str(e.key.name).lower()
+
+
+def shortcuts(actions: dict[str, Callable[[], Any]]) -> ui.keyboard:
+    """Page-wide single-letter shortcuts. Typing in a text box never triggers them."""
+    def on_key(e: KeyEventArguments) -> None:
+        action = actions.get(shortcut_key(e) or "")
+        if action:
+            action()
+    # 'button' is left out of ignore so shortcuts keep working after a mouse click.
+    return ui.keyboard(on_key=on_key, ignore=["input", "select", "textarea"])
+
+
+def local_date(text: str | None) -> str:
+    """A date as 'Nov 4, 2026'.
+
+    Plain dates ('2026-11-04', written with date.today()) are already local. Full
+    timestamps come from SQLite's CURRENT_TIMESTAMP, which is UTC, so they're
+    converted to this computer's time zone first.
+    """
+    if not text:
+        return ""
+    try:
+        d = datetime.fromisoformat(text)
+    except ValueError:
+        return text
+    if len(text) > 10:
+        d = d.replace(tzinfo=timezone.utc).astimezone()
+    return f"{d:%b} {d.day}, {d.year}"
 
 
 def local_time(utc_text: str | None) -> str:
